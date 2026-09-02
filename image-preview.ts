@@ -304,6 +304,119 @@ const styles = `
   }
 `;
 
+const LIST_MEDIA_RPC_URL = "/api/v1/plugins/image-preview/rpc/listMedia";
+const PREVIEW_REFRESH_LEAD_MS = 30_000;
+
+type LocalMediaPath = { kind: "host" | "workspace"; path: string };
+type FolderPreview = { urlsByPath: Map<string, string>; expiresAtMs: number };
+type ListMediaEnvelope =
+  | { ok: true; result: { items: Array<{ path: string; url: string }>; expiresAtMs: number } }
+  | { ok: false; error?: { message?: string } };
+
+const folderPreviews = new Map<string, Promise<FolderPreview> | FolderPreview>();
+
+function currentThreadId(): string | null {
+  const match = window.location.pathname.match(/(?:^|\/)\b(thr_[A-Za-z0-9_-]+)\b/);
+  return match?.[1] ?? null;
+}
+
+function normalizeMediaPath(value: string): string {
+  return value.replaceAll("\\", "/").replace(/\/+$/, "");
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Hrefs BB cannot serve as-is: absolute host paths, file:// URLs, and
+ * workspace-relative paths. Everything with a real scheme (http, blob, data)
+ * is left alone.
+ */
+export function localMediaPath(rawHref: string): LocalMediaPath | null {
+  const trimmed = rawHref.trim();
+  if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("?")) return null;
+  if (/^file:\/\//i.test(trimmed)) {
+    try {
+      return { kind: "host", path: safeDecode(new URL(trimmed).pathname) };
+    } catch {
+      return null;
+    }
+  }
+  // A drive letter looks like a URL scheme; test it before the scheme check.
+  if (/^[a-z]:[\\/]/i.test(trimmed)) {
+    return { kind: "host", path: normalizeMediaPath(safeDecode(trimmed.split(/[?#]/)[0] ?? "")) };
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return null;
+  const withoutQuery = safeDecode(trimmed.split(/[?#]/)[0] ?? "");
+  if (!withoutQuery) return null;
+  if (withoutQuery.startsWith("/")) {
+    return { kind: "host", path: normalizeMediaPath(withoutQuery) };
+  }
+  return { kind: "workspace", path: normalizeMediaPath(withoutQuery.replace(/^\.\//, "")) };
+}
+
+async function fetchFolderPreview(
+  local: LocalMediaPath,
+  threadId: string | null,
+): Promise<FolderPreview> {
+  const response = await fetch(LIST_MEDIA_RPC_URL, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      path: local.path,
+      source: { kind: local.kind, threadId, environmentId: null, projectId: null },
+    }),
+  });
+  const envelope = (await response.json()) as ListMediaEnvelope;
+  if (!response.ok || !envelope.ok) {
+    throw new Error(
+      (!envelope.ok ? envelope.error?.message : null) ?? "Could not resolve media preview.",
+    );
+  }
+  return {
+    urlsByPath: new Map(
+      envelope.result.items.map((item) => [normalizeMediaPath(item.path), item.url]),
+    ),
+    expiresAtMs: envelope.result.expiresAtMs,
+  };
+}
+
+/** Resolve a local media link to a BB preview URL. One RPC per folder; cached until the preview nears expiry. */
+async function resolveLocalMediaUrl(rawHref: string): Promise<string | null> {
+  const local = localMediaPath(rawHref);
+  if (!local) return null;
+  const threadId = currentThreadId();
+  if (!threadId) return null;
+
+  const folder = local.path.includes("/") ? local.path.slice(0, local.path.lastIndexOf("/")) : ".";
+  const cacheKey = `${local.kind}:${threadId}:${folder}`;
+  let entry = folderPreviews.get(cacheKey);
+  if (
+    entry &&
+    !(entry instanceof Promise) &&
+    entry.expiresAtMs - Date.now() < PREVIEW_REFRESH_LEAD_MS
+  ) {
+    folderPreviews.delete(cacheKey);
+    entry = undefined;
+  }
+  if (!entry) {
+    entry = fetchFolderPreview(local, threadId).catch((reason: unknown) => {
+      folderPreviews.delete(cacheKey);
+      throw reason;
+    });
+    folderPreviews.set(cacheKey, entry);
+  }
+  const preview = await entry;
+  folderPreviews.set(cacheKey, preview);
+  return preview.urlsByPath.get(normalizeMediaPath(local.path)) ?? null;
+}
+
 type MediaKind = Exclude<ReturnType<typeof mediaKindForPath>, null>;
 type MediaElement = HTMLImageElement | HTMLVideoElement;
 
@@ -672,6 +785,7 @@ function addImagePreview(
 function addMediaLinkPreview(
   link: HTMLAnchorElement,
   generatedMedia: Map<MediaElement, HTMLAnchorElement>,
+  onResolved?: () => void,
 ): void {
   if (link.dataset[IMAGE_LINK_ATTRIBUTE] === "true") return;
   if (isInsideIgnoredSurface(link)) return;
@@ -682,6 +796,8 @@ function addMediaLinkPreview(
   if (!kind) return;
   if (link.querySelector("img, video")) return;
 
+  const rawHref = link.getAttribute("href") ?? href;
+  const local = localMediaPath(rawHref);
   const generated =
     kind === "video"
       ? document.createElement("video")
@@ -689,7 +805,6 @@ function addMediaLinkPreview(
   const label = link.textContent?.trim() ||
     (kind === "video" ? "Video preview" : "Image preview");
   if (generated instanceof HTMLVideoElement) {
-    generated.src = href;
     generated.preload = "none";
     generated.muted = true;
     generated.playsInline = true;
@@ -697,7 +812,6 @@ function addMediaLinkPreview(
     generated.autoplay = false;
     generated.setAttribute("aria-label", label);
   } else {
-    generated.src = href;
     generated.alt = label;
     generated.loading = "lazy";
     generated.decoding = "async";
@@ -707,14 +821,32 @@ function addMediaLinkPreview(
   link.append(" ", generated);
   link.dataset[IMAGE_LINK_ATTRIBUTE] = "true";
   generatedMedia.set(generated, link);
+
+  // Start with the raw href so the element joins its gallery at once, unless
+  // it is a file:// URL, which the renderer refuses outright ("Not allowed to
+  // load local resource"). A local path is not a URL BB can serve, so mint a
+  // preview URL through the plugin server and swap it in; galleries rebuild
+  // once it lands.
+  if (!/^file:\/\//i.test(rawHref)) generated.src = href;
+  if (!local) return;
+  void resolveLocalMediaUrl(rawHref)
+    .then((url) => {
+      if (!url || !generated.isConnected || generated.getAttribute("src") === url) return;
+      generated.src = url;
+      onResolved?.();
+    })
+    .catch(() => {
+      // Leave the raw href in place; the tile shows the broken-image state.
+    });
 }
 
 function scanLinks(
   root: ParentNode,
   generatedMedia: Map<MediaElement, HTMLAnchorElement>,
+  onResolved?: () => void,
 ): void {
   const links = root instanceof HTMLAnchorElement ? [root] : Array.from(root.querySelectorAll("a"));
-  for (const link of links) addMediaLinkPreview(link, generatedMedia);
+  for (const link of links) addMediaLinkPreview(link, generatedMedia, onResolved);
 }
 
 function directChildOf(root: Element, element: Element): Element | null {
@@ -1247,9 +1379,19 @@ export function mountImagePreview(signal: AbortSignal): () => void {
     if (event.target === lightbox?.root) closeLightbox();
   };
 
+  let refreshTimer: number | null = null;
+  const scheduleRefresh = () => {
+    if (disposed) return;
+    if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+    refreshTimer = window.setTimeout(() => {
+      refreshTimer = null;
+      if (!disposed) refreshGalleries(originals, galleries, linkedImageTriggers);
+    }, 50);
+  };
+
   const mountBody = () => {
     if (disposed || !document.body) return;
-    scanLinks(document, generatedMedia);
+    scanLinks(document, generatedMedia, scheduleRefresh);
     refreshGalleries(originals, galleries, linkedImageTriggers);
     observer = new MutationObserver((records) => {
       let changed = false;
@@ -1261,7 +1403,7 @@ export function mountImagePreview(signal: AbortSignal): () => void {
             continue;
           }
           if (!hasMediaContent(element)) continue;
-          scanLinks(element, generatedMedia);
+          scanLinks(element, generatedMedia, scheduleRefresh);
           changed = true;
         }
         for (const node of Array.from(record.removedNodes)) {
@@ -1291,6 +1433,11 @@ export function mountImagePreview(signal: AbortSignal): () => void {
   const dispose = () => {
     if (disposed) return;
     disposed = true;
+    if (refreshTimer !== null) {
+      window.clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    folderPreviews.clear();
     observer?.disconnect();
     observer = null;
     if (bodyReadyListener) {

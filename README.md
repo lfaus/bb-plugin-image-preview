@@ -13,6 +13,15 @@ The chat gallery supports media rendered by Markdown, temporary/blob media,
 and ordinary media-file links. Composer previews and small UI artwork are left
 unchanged.
 
+## Local file links in chat
+
+Agents often link media by absolute path (`/Users/you/shots/a.png`) or by a
+workspace-relative path. BB cannot serve those hrefs directly, so the chat
+script asks the plugin server for a preview URL for that file's folder (one
+`listMedia` call per folder, cached until the preview nears expiry) and swaps
+it into the generated tile. Galleries rebuild once the URL lands. Links with a
+real scheme (`https:`, `blob:`, `data:`) are used as-is.
+
 ## Thread storage
 
 When the Thread storage info view is open, the plugin replaces the native file

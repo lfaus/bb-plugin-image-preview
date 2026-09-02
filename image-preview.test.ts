@@ -3,6 +3,7 @@ import {
   isChatImage,
   isChatMedia,
   LIGHTBOX_ID,
+  localMediaPath,
   mountImagePreview,
 } from "./image-preview";
 
@@ -535,3 +536,23 @@ describe("mountImagePreview", () => {
   });
 });
 
+
+describe("localMediaPath", () => {
+  it("treats absolute host paths and file URLs as host media", () => {
+    expect(localMediaPath("/Users/me/shots/a.png")).toEqual({ kind: "host", path: "/Users/me/shots/a.png" });
+    expect(localMediaPath("file:///Users/me/shots/b%20c.png")).toEqual({ kind: "host", path: "/Users/me/shots/b c.png" });
+    expect(localMediaPath("C:\\shots\\a.png")).toEqual({ kind: "host", path: "C:/shots/a.png" });
+  });
+
+  it("treats scheme-less relative paths as workspace media", () => {
+    expect(localMediaPath("app/src/test/a.png")).toEqual({ kind: "workspace", path: "app/src/test/a.png" });
+    expect(localMediaPath("./docs/b.png?x=1")).toEqual({ kind: "workspace", path: "docs/b.png" });
+  });
+
+  it("leaves served URLs alone", () => {
+    expect(localMediaPath("https://example.com/a.png")).toBeNull();
+    expect(localMediaPath("blob:http://localhost/abc")).toBeNull();
+    expect(localMediaPath("data:image/png;base64,AAAA")).toBeNull();
+    expect(localMediaPath("/api/v1/file-previews/x/a.png")).toEqual({ kind: "host", path: "/api/v1/file-previews/x/a.png" });
+  });
+});
