@@ -1,3 +1,5 @@
+import { mediaKindForPath } from "./media";
+
 const IMAGE_PREVIEW_ATTRIBUTE = "bbImagePreview";
 const IMAGE_PREVIEW_DATA_ATTRIBUTE = "data-bb-image-preview";
 const GALLERY_ATTRIBUTE = "bbImagePreviewGallery";
@@ -10,12 +12,13 @@ const GALLERY_NAV_ATTRIBUTE = "bbImagePreviewNav";
 const GALLERY_CLOSE_ATTRIBUTE = "bbImagePreviewClose";
 const GENERATED_IMAGE_ATTRIBUTE = "bbImagePreviewGenerated";
 const IMAGE_LINK_ATTRIBUTE = "bbImagePreviewLink";
+const LINK_TARGET_ATTRIBUTE = "bbImagePreviewLinkTarget";
+const MEDIA_KIND_ATTRIBUTE = "bbImagePreviewMediaKind";
 
 export const LIGHTBOX_ID = "bb-image-preview-lightbox";
 
 const STYLES_ID = "bb-image-preview-styles";
 const MAX_GRID_ITEMS = 4;
-const IMAGE_FILE_PATTERN = /\.(?:avif|bmp|gif|heic|heif|jpe?g|png|svg|webp)(?:[?#].*)?$/i;
 const GALLERY_OWNED_SELECTOR = "[data-bb-image-preview-owned='true']";
 const GALLERY_SELECTOR = "[data-bb-image-preview-gallery='true']";
 const GALLERY_TILE_SELECTOR = "[data-bb-image-preview-tile='true']";
@@ -58,6 +61,12 @@ const styles = `
 
   .bb-image-preview-gallery[data-visible-count="2"] {
     aspect-ratio: 2 / 1;
+  }
+
+  .bb-image-preview-gallery[data-visible-count="1"] {
+    grid-template-columns: minmax(0, 1fr);
+    width: min(100%, 20rem);
+    aspect-ratio: 4 / 3;
   }
 
   .bb-image-preview-gallery[data-visible-count="3"] {
@@ -105,6 +114,35 @@ const styles = `
     height: 100%;
     object-fit: cover;
     transition: transform 160ms ease;
+  }
+
+  .bb-image-preview-gallery-video-placeholder {
+    width: 100%;
+    height: 100%;
+    background:
+      radial-gradient(circle at 50% 42%, color-mix(in srgb, var(--foreground, CanvasText) 10%, transparent), transparent 48%),
+      var(--card, Canvas);
+  }
+
+  .bb-image-preview-gallery-play {
+    position: absolute;
+    z-index: 1;
+    top: 50%;
+    left: 50%;
+    display: grid;
+    place-items: center;
+    width: 3rem;
+    height: 3rem;
+    padding-left: 0.1875rem;
+    color: var(--background, Canvas);
+    background: color-mix(in srgb, var(--foreground, CanvasText) 82%, transparent);
+    border: 1px solid color-mix(in srgb, var(--background, Canvas) 45%, transparent);
+    border-radius: 999px;
+    box-shadow: 0 0.25rem 1rem color-mix(in srgb, var(--foreground, CanvasText) 28%, transparent);
+    font-size: 1.25rem;
+    line-height: 1;
+    pointer-events: none;
+    transform: translate(-50%, -50%);
   }
 
   .bb-image-preview-gallery-tile:hover .bb-image-preview-gallery-image {
@@ -165,6 +203,14 @@ const styles = `
     object-fit: contain;
     border-radius: var(--radius-lg, 0.75rem);
     box-shadow: 0 1rem 3rem color-mix(in srgb, var(--foreground, CanvasText) 30%, transparent);
+  }
+
+  .bb-image-preview-expanded[hidden] {
+    display: none;
+  }
+
+  video.bb-image-preview-expanded {
+    background: var(--background, Canvas);
   }
 
   .bb-image-preview-close,
@@ -258,17 +304,27 @@ const styles = `
   }
 `;
 
-type OriginalImageAttributes = {
+type MediaKind = Exclude<ReturnType<typeof mediaKindForPath>, null>;
+type MediaElement = HTMLImageElement | HTMLVideoElement;
+
+type OriginalMediaAttributes = {
   className: string;
   role: string | null;
   tabIndex: string | null;
   ariaLabel: string | null;
+  ariaHasPopup: string | null;
+};
+
+type OriginalLinkAttributes = {
+  role: string | null;
+  ariaLabel: string | null;
+  ariaHasPopup: string | null;
 };
 
 type GalleryRecord = {
   messageRoot: Element;
   root: HTMLDivElement;
-  sources: HTMLImageElement[];
+  sources: MediaElement[];
   hiddenLinks: Set<HTMLAnchorElement>;
   emptyContainers: Set<HTMLElement>;
 };
@@ -276,6 +332,7 @@ type GalleryRecord = {
 type Lightbox = {
   root: HTMLDivElement;
   image: HTMLImageElement;
+  video: HTMLVideoElement;
   caption: HTMLDivElement;
   counter: HTMLDivElement;
   closeButton: HTMLButtonElement;
@@ -284,19 +341,41 @@ type Lightbox = {
 };
 
 type ActiveGallery = {
-  items: HTMLImageElement[];
+  items: MediaElement[];
   index: number;
 };
 
-function imageSource(image: HTMLImageElement): string {
-  return image.currentSrc || image.getAttribute("src") || "";
+function mediaKind(media: MediaElement): MediaKind {
+  return media instanceof HTMLVideoElement ? "video" : "image";
 }
 
-function isImageFileUrl(value: string): boolean {
+function mediaSource(media: MediaElement): string {
+  if (media instanceof HTMLImageElement) {
+    return media.currentSrc || media.getAttribute("src") || "";
+  }
+
+  const directSource = media.currentSrc || media.getAttribute("src") || "";
+  if (directSource) return directSource;
+
+  const nestedSource = media.querySelector<HTMLSourceElement>("source[src]");
+  return nestedSource?.src || nestedSource?.getAttribute("src") || "";
+}
+
+function mediaKindForUrl(value: string): MediaKind | null {
   try {
-    return IMAGE_FILE_PATTERN.test(new URL(value, window.location.href).pathname);
+    return mediaKindForPath(new URL(value, window.location.href).pathname);
   } catch {
-    return IMAGE_FILE_PATTERN.test(value);
+    return mediaKindForPath(value);
+  }
+}
+
+function isBbFilePreviewUrl(value: string): boolean {
+  try {
+    return new URL(value, window.location.href).pathname.includes(
+      "/api/v1/file-previews/",
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -328,33 +407,53 @@ function findMessageAncestor(element: Element): Element | null {
 }
 
 function isInsideIgnoredSurface(element: Element): boolean {
-  return Boolean(
-    element.closest(
-      "[data-bb-image-preview-ignore], button, [role='button'], [contenteditable='true'], textarea, input, nav, aside, header, form",
-    ),
+  const ignoredAncestor = element.closest(
+    "[data-bb-image-preview-ignore], button, [role='button'], [contenteditable='true'], textarea, input, nav, aside, header, form",
   );
+  if (
+    ignoredAncestor instanceof HTMLAnchorElement &&
+    ignoredAncestor.dataset[LINK_TARGET_ATTRIBUTE] === "true"
+  ) {
+    return false;
+  }
+  return Boolean(ignoredAncestor);
 }
 
-function isLargeEnough(image: HTMLImageElement): boolean {
+function isLargeEnough(media: MediaElement): boolean {
+  if (media instanceof HTMLVideoElement) {
+    return (
+      media.width >= 64 ||
+      media.height >= 64 ||
+      media.videoWidth >= 64 ||
+      media.videoHeight >= 64
+    );
+  }
+
   return (
-    image.width >= 64 ||
-    image.height >= 64 ||
-    image.naturalWidth >= 64 ||
-    image.naturalHeight >= 64
+    media.width >= 64 ||
+    media.height >= 64 ||
+    media.naturalWidth >= 64 ||
+    media.naturalHeight >= 64
   );
 }
 
-function imageShape(image: HTMLImageElement): "landscape" | "portrait" | "square" {
-  const width = image.naturalWidth || Number(image.getAttribute("width")) || image.width;
-  const height = image.naturalHeight || Number(image.getAttribute("height")) || image.height;
+function mediaShape(media: MediaElement): "landscape" | "portrait" | "square" {
+  const width =
+    (media instanceof HTMLVideoElement ? media.videoWidth : media.naturalWidth) ||
+    Number(media.getAttribute("width")) ||
+    media.width;
+  const height =
+    (media instanceof HTMLVideoElement ? media.videoHeight : media.naturalHeight) ||
+    Number(media.getAttribute("height")) ||
+    media.height;
   if (!width || !height) return "square";
   if (width > height * 1.15) return "landscape";
   if (height > width * 1.15) return "portrait";
   return "square";
 }
 
-function galleryShape(images: HTMLImageElement[]): "landscape" | "portrait" | "mixed" {
-  const shapes = new Set(images.map(imageShape));
+function galleryShape(media: MediaElement[]): "landscape" | "portrait" | "mixed" {
+  const shapes = new Set(media.map(mediaShape));
   if (shapes.size === 1) {
     const shape = shapes.values().next().value;
     if (shape === "landscape" || shape === "portrait") return shape;
@@ -362,21 +461,34 @@ function galleryShape(images: HTMLImageElement[]): "landscape" | "portrait" | "m
   return "mixed";
 }
 
-/** Return true for message images and useful image links in the main chat area. */
-export function isChatImage(image: HTMLImageElement): boolean {
-  if (image.dataset[GALLERY_CLONE_ATTRIBUTE] === "true") return false;
-  if (image.dataset[IMAGE_PREVIEW_ATTRIBUTE] === "true") return false;
-  if (isInsideIgnoredSurface(image)) return false;
+/** Return true for message media and useful media in the main chat area. */
+export function isChatMedia(media: MediaElement): boolean {
+  if (media.dataset[GALLERY_CLONE_ATTRIBUTE] === "true") return false;
+  if (media.dataset[IMAGE_PREVIEW_ATTRIBUTE] === "true") return false;
+  if (isInsideIgnoredSurface(media)) return false;
 
-  const source = imageSource(image);
+  const source = mediaSource(media);
   if (!source) return false;
-  if (findMessageAncestor(image)) return true;
+  if (findMessageAncestor(media)) return true;
 
-  const isTemporaryImage = source.startsWith("blob:") || source.startsWith("data:image/");
-  const isInMainContent = Boolean(image.closest("main"));
-  const hasUsefulDescription = image.alt.trim().length > 0 || isImageFileUrl(source);
+  const isTemporaryMedia =
+    source.startsWith("blob:") ||
+    source.startsWith("data:image/") ||
+    source.startsWith("data:video/");
+  const isInMainContent = Boolean(media.closest("main"));
+  const hasUsefulDescription =
+    (media instanceof HTMLImageElement
+      ? media.alt.trim().length > 0
+      : Boolean(media.getAttribute("aria-label")?.trim() || media.title.trim())) ||
+    mediaKindForUrl(source) !== null;
 
-  return isInMainContent && (isTemporaryImage || hasUsefulDescription || isLargeEnough(image));
+  return isInMainContent &&
+    (isTemporaryMedia || hasUsefulDescription || isLargeEnough(media));
+}
+
+/** Backward-compatible image predicate used by existing callers and tests. */
+export function isChatImage(image: HTMLImageElement): boolean {
+  return isChatMedia(image);
 }
 
 function ensureStyles(): HTMLStyleElement {
@@ -394,9 +506,10 @@ function createLightbox(): Lightbox {
   const root = document.createElement("div");
   root.id = LIGHTBOX_ID;
   root.hidden = true;
+  root.dataset[GALLERY_OWNED_ATTRIBUTE] = "true";
   root.setAttribute("role", "dialog");
   root.setAttribute("aria-modal", "true");
-  root.setAttribute("aria-label", "Image preview");
+  root.setAttribute("aria-label", "Media preview");
 
   const dialog = document.createElement("div");
   dialog.className = "bb-image-preview-dialog";
@@ -405,26 +518,34 @@ function createLightbox(): Lightbox {
   closeButton.className = "bb-image-preview-close";
   closeButton.type = "button";
   closeButton.dataset[GALLERY_CLOSE_ATTRIBUTE] = "true";
-  closeButton.setAttribute("aria-label", "Close image preview");
+  closeButton.setAttribute("aria-label", "Close media preview");
   closeButton.textContent = "×";
 
   const previousButton = document.createElement("button");
   previousButton.className = "bb-image-preview-nav";
   previousButton.type = "button";
   previousButton.dataset[GALLERY_NAV_ATTRIBUTE] = "previous";
-  previousButton.setAttribute("aria-label", "Previous image");
+  previousButton.setAttribute("aria-label", "Previous media item");
   previousButton.textContent = "‹";
 
   const nextButton = document.createElement("button");
   nextButton.className = "bb-image-preview-nav";
   nextButton.type = "button";
   nextButton.dataset[GALLERY_NAV_ATTRIBUTE] = "next";
-  nextButton.setAttribute("aria-label", "Next image");
+  nextButton.setAttribute("aria-label", "Next media item");
   nextButton.textContent = "›";
 
   const image = document.createElement("img");
   image.className = "bb-image-preview-expanded";
   image.alt = "";
+
+  const video = document.createElement("video");
+  video.className = "bb-image-preview-expanded";
+  video.controls = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  video.preload = "metadata";
+  video.hidden = true;
 
   const counter = document.createElement("div");
   counter.className = "bb-image-preview-counter";
@@ -433,13 +554,22 @@ function createLightbox(): Lightbox {
   const caption = document.createElement("div");
   caption.className = "bb-image-preview-caption";
 
-  dialog.append(closeButton, previousButton, image, nextButton, counter, caption);
+  dialog.append(
+    closeButton,
+    previousButton,
+    image,
+    video,
+    nextButton,
+    counter,
+    caption,
+  );
   root.append(dialog);
   document.body.append(root);
 
   return {
     root,
     image,
+    video,
     caption,
     counter,
     closeButton,
@@ -448,11 +578,18 @@ function createLightbox(): Lightbox {
   };
 }
 
-function imageLabel(image: HTMLImageElement): string {
-  const alt = image.alt.trim();
-  if (alt) return alt;
+function mediaLabel(media: MediaElement): string {
+  if (media instanceof HTMLImageElement) {
+    const alt = media.alt.trim();
+    if (alt) return alt;
+  } else {
+    const accessibleLabel = media.getAttribute("aria-label")?.trim();
+    if (accessibleLabel) return accessibleLabel;
+    const title = media.title.trim();
+    if (title) return title;
+  }
 
-  const source = imageSource(image);
+  const source = mediaSource(media);
   try {
     const pathname = new URL(source, window.location.href).pathname;
     const filename = pathname.split("/").pop();
@@ -461,67 +598,123 @@ function imageLabel(image: HTMLImageElement): string {
     // A malformed or temporary URL does not need a visible label.
   }
 
-  return "Image preview";
+  return media instanceof HTMLVideoElement ? "Video preview" : "Image preview";
 }
 
-function rememberImage(
-  image: HTMLImageElement,
-  originals: Map<HTMLImageElement, OriginalImageAttributes>,
+function rememberMedia(
+  media: MediaElement,
+  originals: Map<MediaElement, OriginalMediaAttributes>,
 ): void {
-  if (originals.has(image)) return;
-  originals.set(image, {
-    className: image.className,
-    role: image.getAttribute("role"),
-    tabIndex: image.getAttribute("tabindex"),
-    ariaLabel: image.getAttribute("aria-label"),
+  if (originals.has(media)) return;
+  originals.set(media, {
+    className: media.className,
+    role: media.getAttribute("role"),
+    tabIndex: media.getAttribute("tabindex"),
+    ariaLabel: media.getAttribute("aria-label"),
+    ariaHasPopup: media.getAttribute("aria-haspopup"),
   });
+}
+
+function rememberLink(
+  link: HTMLAnchorElement,
+  originals: Map<HTMLAnchorElement, OriginalLinkAttributes>,
+): void {
+  if (originals.has(link)) return;
+  originals.set(link, {
+    role: link.getAttribute("role"),
+    ariaLabel: link.getAttribute("aria-label"),
+    ariaHasPopup: link.getAttribute("aria-haspopup"),
+  });
+}
+
+function configureLinkedImageTrigger(
+  image: HTMLImageElement,
+  links: Map<HTMLAnchorElement, OriginalLinkAttributes>,
+): boolean {
+  const link = image.closest<HTMLAnchorElement>("a");
+  if (!link) return false;
+
+  rememberLink(link, links);
+  link.dataset[LINK_TARGET_ATTRIBUTE] = "true";
+  if (!link.hasAttribute("role")) link.setAttribute("role", "button");
+  if (!link.hasAttribute("aria-label")) {
+    link.setAttribute("aria-label", `Open image: ${mediaLabel(image)}`);
+  }
+  link.setAttribute("aria-haspopup", "dialog");
+
+  image.removeAttribute("role");
+  image.removeAttribute("tabindex");
+  image.removeAttribute("aria-label");
+  return true;
 }
 
 function addImagePreview(
   image: HTMLImageElement,
-  originals: Map<HTMLImageElement, OriginalImageAttributes>,
+  originals: Map<MediaElement, OriginalMediaAttributes>,
+  links: Map<HTMLAnchorElement, OriginalLinkAttributes>,
 ): void {
   if (!isChatImage(image)) return;
 
-  rememberImage(image, originals);
+  rememberMedia(image, originals);
   image.dataset[IMAGE_PREVIEW_ATTRIBUTE] = "true";
+  image.dataset[MEDIA_KIND_ATTRIBUTE] = "image";
   image.classList.add("bb-image-preview-thumbnail");
-  if (!image.hasAttribute("role")) image.setAttribute("role", "button");
-  if (!image.hasAttribute("tabindex")) image.setAttribute("tabindex", "0");
-  if (!image.hasAttribute("aria-label")) {
-    image.setAttribute("aria-label", `Open image: ${imageLabel(image)}`);
+  if (!configureLinkedImageTrigger(image, links)) {
+    if (!image.hasAttribute("role")) image.setAttribute("role", "button");
+    if (!image.hasAttribute("tabindex")) image.setAttribute("tabindex", "0");
+    if (!image.hasAttribute("aria-label")) {
+      image.setAttribute("aria-label", `Open image: ${mediaLabel(image)}`);
+    }
+    image.setAttribute("aria-haspopup", "dialog");
   }
 }
 
-function addImageLinkPreview(
+function addMediaLinkPreview(
   link: HTMLAnchorElement,
-  generatedImages: Map<HTMLImageElement, HTMLAnchorElement>,
+  generatedMedia: Map<MediaElement, HTMLAnchorElement>,
 ): void {
   if (link.dataset[IMAGE_LINK_ATTRIBUTE] === "true") return;
   if (isInsideIgnoredSurface(link)) return;
   if (!findMessageAncestor(link)) return;
 
   const href = link.href || link.getAttribute("href") || "";
-  if (!isImageFileUrl(href)) return;
-  if (link.querySelector("img")) return;
+  const kind = mediaKindForUrl(href);
+  if (!kind) return;
+  if (link.querySelector("img, video")) return;
 
-  const image = document.createElement("img");
-  image.src = href;
-  image.alt = link.textContent?.trim() || "Image preview";
-  image.loading = "lazy";
-  image.decoding = "async";
-  image.dataset[GENERATED_IMAGE_ATTRIBUTE] = "true";
-  link.append(" ", image);
+  const generated =
+    kind === "video"
+      ? document.createElement("video")
+      : document.createElement("img");
+  const label = link.textContent?.trim() ||
+    (kind === "video" ? "Video preview" : "Image preview");
+  if (generated instanceof HTMLVideoElement) {
+    generated.src = href;
+    generated.preload = "none";
+    generated.muted = true;
+    generated.playsInline = true;
+    generated.controls = false;
+    generated.autoplay = false;
+    generated.setAttribute("aria-label", label);
+  } else {
+    generated.src = href;
+    generated.alt = label;
+    generated.loading = "lazy";
+    generated.decoding = "async";
+  }
+  generated.dataset[GENERATED_IMAGE_ATTRIBUTE] = "true";
+  generated.dataset[MEDIA_KIND_ATTRIBUTE] = kind;
+  link.append(" ", generated);
   link.dataset[IMAGE_LINK_ATTRIBUTE] = "true";
-  generatedImages.set(image, link);
+  generatedMedia.set(generated, link);
 }
 
 function scanLinks(
   root: ParentNode,
-  generatedImages: Map<HTMLImageElement, HTMLAnchorElement>,
+  generatedMedia: Map<MediaElement, HTMLAnchorElement>,
 ): void {
   const links = root instanceof HTMLAnchorElement ? [root] : Array.from(root.querySelectorAll("a"));
-  for (const link of links) addImageLinkPreview(link, generatedImages);
+  for (const link of links) addMediaLinkPreview(link, generatedMedia);
 }
 
 function directChildOf(root: Element, element: Element): Element | null {
@@ -542,7 +735,7 @@ function isGalleryOnlyContainer(container: Element): boolean {
 
     const element = child as Element;
     if (
-      element instanceof HTMLImageElement &&
+      (element instanceof HTMLImageElement || element instanceof HTMLVideoElement) &&
       element.dataset[GALLERY_SOURCE_ATTRIBUTE] === "true"
     ) {
       continue;
@@ -561,8 +754,8 @@ function isGalleryOnlyContainer(container: Element): boolean {
 
 function buildGallery(
   messageRoot: Element,
-  sources: HTMLImageElement[],
-  originals: Map<HTMLImageElement, OriginalImageAttributes>,
+  sources: MediaElement[],
+  originals: Map<MediaElement, OriginalMediaAttributes>,
   galleries: Map<HTMLDivElement, GalleryRecord>,
 ): void {
   const visibleCount = Math.min(MAX_GRID_ITEMS, sources.length);
@@ -574,19 +767,22 @@ function buildGallery(
   gallery.dataset.totalCount = String(sources.length);
   gallery.dataset.shape = galleryShape(sources);
   gallery.setAttribute("role", "group");
-  gallery.setAttribute("aria-label", `${sources.length} images`);
+  const kinds = new Set(sources.map(mediaKind));
+  const galleryKindLabel =
+    kinds.size > 1 ? "media items" : kinds.has("video") ? "videos" : "images";
+  gallery.setAttribute("aria-label", `${sources.length} ${galleryKindLabel}`);
 
   const hiddenLinks = new Set<HTMLAnchorElement>();
   const emptyContainers = new Set<HTMLElement>();
 
   for (const source of sources) {
-    rememberImage(source, originals);
+    rememberMedia(source, originals);
     source.dataset[GALLERY_SOURCE_ATTRIBUTE] = "true";
+    source.dataset[MEDIA_KIND_ATTRIBUTE] = mediaKind(source);
     source.classList.add("bb-image-preview-gallery-source");
+    if (source instanceof HTMLVideoElement) source.pause();
 
-    const link = source.closest<HTMLAnchorElement>(
-      `a[data-${IMAGE_LINK_ATTRIBUTE.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}='true']`,
-    );
+    const link = source.closest<HTMLAnchorElement>("a");
     if (link) {
       hiddenLinks.add(link);
       link.classList.add("bb-image-preview-gallery-source-link");
@@ -607,24 +803,61 @@ function buildGallery(
 
   for (let index = 0; index < visibleCount; index += 1) {
     const source = sources[index];
+    const kind = mediaKind(source);
     const tile = document.createElement("button");
     tile.type = "button";
     tile.className = "bb-image-preview-gallery-tile";
     tile.dataset[GALLERY_TILE_ATTRIBUTE] = "true";
     tile.dataset[GALLERY_INDEX_ATTRIBUTE] = String(index);
+    tile.dataset[MEDIA_KIND_ATTRIBUTE] = kind;
+    tile.setAttribute("aria-haspopup", "dialog");
     tile.setAttribute(
       "aria-label",
-      `Open image ${index + 1} of ${sources.length}: ${imageLabel(source)}`,
+      kind === "video"
+        ? `Play video ${index + 1} of ${sources.length} in expanded view: ${mediaLabel(source)}`
+        : `Open image ${index + 1} of ${sources.length}: ${mediaLabel(source)}`,
     );
 
-    const preview = document.createElement("img");
-    preview.className = "bb-image-preview-gallery-image";
-    preview.src = imageSource(source);
-    preview.alt = source.alt;
-    preview.loading = "lazy";
-    preview.decoding = "async";
-    preview.dataset[GALLERY_CLONE_ATTRIBUTE] = "true";
-    tile.append(preview);
+    if (source instanceof HTMLVideoElement) {
+      const poster = source.poster || source.getAttribute("poster") || "";
+      if (poster) {
+        const preview = document.createElement("img");
+        preview.className = "bb-image-preview-gallery-image";
+        preview.src = poster;
+        preview.alt = "";
+        preview.loading = "lazy";
+        preview.decoding = "async";
+        preview.dataset[GALLERY_CLONE_ATTRIBUTE] = "true";
+        tile.append(preview);
+      } else {
+        const preview = document.createElement("video");
+        preview.className = "bb-image-preview-gallery-image";
+        preview.src = mediaSource(source);
+        preview.preload = "metadata";
+        preview.muted = true;
+        preview.playsInline = true;
+        preview.controls = false;
+        preview.autoplay = false;
+        preview.setAttribute("aria-hidden", "true");
+        preview.dataset[GALLERY_CLONE_ATTRIBUTE] = "true";
+        tile.append(preview);
+      }
+
+      const play = document.createElement("span");
+      play.className = "bb-image-preview-gallery-play";
+      play.setAttribute("aria-hidden", "true");
+      play.textContent = "▶";
+      tile.append(play);
+    } else {
+      const preview = document.createElement("img");
+      preview.className = "bb-image-preview-gallery-image";
+      preview.src = mediaSource(source);
+      preview.alt = source.alt;
+      preview.loading = "lazy";
+      preview.decoding = "async";
+      preview.dataset[GALLERY_CLONE_ATTRIBUTE] = "true";
+      tile.append(preview);
+    }
 
     if (index === visibleCount - 1 && sources.length > visibleCount) {
       const more = document.createElement("span");
@@ -646,24 +879,27 @@ function buildGallery(
   galleries.set(gallery, record);
 }
 
-function restoreImage(
-  image: HTMLImageElement,
-  original: OriginalImageAttributes,
+function restoreMedia(
+  media: MediaElement,
+  original: OriginalMediaAttributes,
 ): void {
-  image.className = original.className;
-  if (original.role === null) image.removeAttribute("role");
-  else image.setAttribute("role", original.role);
-  if (original.tabIndex === null) image.removeAttribute("tabindex");
-  else image.setAttribute("tabindex", original.tabIndex);
-  if (original.ariaLabel === null) image.removeAttribute("aria-label");
-  else image.setAttribute("aria-label", original.ariaLabel);
-  image.removeAttribute(IMAGE_PREVIEW_DATA_ATTRIBUTE);
-  image.removeAttribute("data-bb-image-preview-gallery-source");
+  media.className = original.className;
+  if (original.role === null) media.removeAttribute("role");
+  else media.setAttribute("role", original.role);
+  if (original.tabIndex === null) media.removeAttribute("tabindex");
+  else media.setAttribute("tabindex", original.tabIndex);
+  if (original.ariaLabel === null) media.removeAttribute("aria-label");
+  else media.setAttribute("aria-label", original.ariaLabel);
+  if (original.ariaHasPopup === null) media.removeAttribute("aria-haspopup");
+  else media.setAttribute("aria-haspopup", original.ariaHasPopup);
+  media.removeAttribute(IMAGE_PREVIEW_DATA_ATTRIBUTE);
+  media.removeAttribute("data-bb-image-preview-gallery-source");
+  media.removeAttribute("data-bb-image-preview-media-kind");
 }
 
 function destroyGallery(
   record: GalleryRecord,
-  originals: Map<HTMLImageElement, OriginalImageAttributes>,
+  originals: Map<MediaElement, OriginalMediaAttributes>,
   galleries: Map<HTMLDivElement, GalleryRecord>,
 ): void {
   galleries.delete(record.root);
@@ -672,7 +908,7 @@ function destroyGallery(
   for (const source of record.sources) {
     const original = originals.get(source);
     if (original) {
-      restoreImage(source, original);
+      restoreMedia(source, original);
       originals.delete(source);
     }
   }
@@ -684,52 +920,68 @@ function destroyGallery(
   }
 }
 
-function restoreAllImages(
-  originals: Map<HTMLImageElement, OriginalImageAttributes>,
+function restoreAllMedia(
+  originals: Map<MediaElement, OriginalMediaAttributes>,
 ): void {
-  for (const [image, original] of originals) restoreImage(image, original);
+  for (const [media, original] of originals) restoreMedia(media, original);
   originals.clear();
 }
 
 function refreshGalleries(
-  originals: Map<HTMLImageElement, OriginalImageAttributes>,
+  originals: Map<MediaElement, OriginalMediaAttributes>,
   galleries: Map<HTMLDivElement, GalleryRecord>,
+  links: Map<HTMLAnchorElement, OriginalLinkAttributes>,
 ): void {
   for (const record of Array.from(galleries.values())) {
     destroyGallery(record, originals, galleries);
   }
-  restoreAllImages(originals);
+  restoreAllMedia(originals);
 
-  const groupedImages = new Map<Element, HTMLImageElement[]>();
-  const images = Array.from(document.querySelectorAll("img"));
-  for (const image of images) {
-    if (!isChatImage(image)) continue;
+  const groupedMedia = new Map<Element, MediaElement[]>();
+  const mediaElements = Array.from(document.querySelectorAll("img, video")).filter(
+    (media): media is MediaElement =>
+      media instanceof HTMLImageElement || media instanceof HTMLVideoElement,
+  );
+  for (const media of mediaElements) {
+    if (!isChatMedia(media)) continue;
 
-    const messageRoot = findMessageAncestor(image);
+    const messageRoot = findMessageAncestor(media);
     if (!messageRoot) {
-      addImagePreview(image, originals);
+      if (media instanceof HTMLImageElement) {
+        addImagePreview(media, originals, links);
+      } else {
+        const standaloneRoot =
+          media.parentElement instanceof HTMLAnchorElement
+            ? media.parentElement.parentElement
+            : media.parentElement;
+        if (standaloneRoot) buildGallery(standaloneRoot, [media], originals, galleries);
+      }
       continue;
     }
 
-    const group = groupedImages.get(messageRoot) ?? [];
-    group.push(image);
-    groupedImages.set(messageRoot, group);
+    const group = groupedMedia.get(messageRoot) ?? [];
+    group.push(media);
+    groupedMedia.set(messageRoot, group);
   }
 
-  for (const [messageRoot, group] of groupedImages) {
+  for (const [messageRoot, group] of groupedMedia) {
     if (group.length > 1) buildGallery(messageRoot, group, originals, galleries);
-    else addImagePreview(group[0], originals);
+    else if (group[0] instanceof HTMLVideoElement) {
+      buildGallery(messageRoot, group, originals, galleries);
+    } else {
+      addImagePreview(group[0], originals, links);
+    }
   }
 }
 
-function hasImageContent(element: Element): boolean {
-  if (element instanceof HTMLImageElement) return true;
+function hasMediaContent(element: Element): boolean {
+  if (element instanceof HTMLImageElement || element instanceof HTMLVideoElement) return true;
   if (element instanceof HTMLAnchorElement) {
-    return isImageFileUrl(element.href || element.getAttribute("href") || "");
+    return mediaKindForUrl(element.href || element.getAttribute("href") || "") !== null;
   }
-  if (element.querySelector("img")) return true;
+  if (element.querySelector("img, video")) return true;
   return Array.from(element.querySelectorAll("a")).some((link) =>
-    isImageFileUrl(link.href || link.getAttribute("href") || ""),
+    mediaKindForUrl(link.href || link.getAttribute("href") || "") !== null,
   );
 }
 
@@ -741,34 +993,105 @@ export function mountImagePreview(signal: AbortSignal): () => void {
   let activeGallery: ActiveGallery | null = null;
   let previousFocus: HTMLElement | null = null;
   let originalOverflow: string | null = null;
+  let expandedVideoObjectUrl: string | null = null;
+  let expandedVideoLoadToken = 0;
 
-  const originals = new Map<HTMLImageElement, OriginalImageAttributes>();
-  const generatedImages = new Map<HTMLImageElement, HTMLAnchorElement>();
+  const originals = new Map<MediaElement, OriginalMediaAttributes>();
+  const generatedMedia = new Map<MediaElement, HTMLAnchorElement>();
   const galleries = new Map<HTMLDivElement, GalleryRecord>();
+  const linkedImageTriggers = new Map<HTMLAnchorElement, OriginalLinkAttributes>();
 
   ensureStyles();
+
+  const resetExpandedVideo = () => {
+    expandedVideoLoadToken += 1;
+    if (expandedVideoObjectUrl) {
+      URL.revokeObjectURL(expandedVideoObjectUrl);
+      expandedVideoObjectUrl = null;
+    }
+    if (!lightbox) return;
+    const { video } = lightbox;
+    const hadSource = video.hasAttribute("src");
+    if (hadSource || !video.paused) video.pause();
+    video.removeAttribute("src");
+    video.removeAttribute("poster");
+    video.removeAttribute("aria-label");
+    video.hidden = true;
+    if (hadSource) video.load();
+  };
 
   const renderLightbox = () => {
     if (!lightbox || !activeGallery) return;
 
     const item = activeGallery.items[activeGallery.index];
-    const label = imageLabel(item);
-    lightbox.image.src = imageSource(item);
-    lightbox.image.alt = item.alt;
+    const kind = mediaKind(item);
+    const label = mediaLabel(item);
+    if (item instanceof HTMLVideoElement) {
+      resetExpandedVideo();
+      lightbox.image.hidden = true;
+      lightbox.image.removeAttribute("src");
+      lightbox.image.alt = "";
+      lightbox.video.hidden = false;
+      const source = mediaSource(item);
+      const loadToken = expandedVideoLoadToken;
+      const expandedLightbox = lightbox;
+      const poster = item.poster || item.getAttribute("poster") || "";
+      if (poster) lightbox.video.poster = poster;
+      lightbox.video.setAttribute("aria-label", label);
+      if (!isBbFilePreviewUrl(source)) {
+        lightbox.video.src = source;
+      } else {
+        void fetch(source, { credentials: "same-origin" })
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error(`Video preview returned ${response.status}`);
+            }
+            return response.blob();
+          })
+          .then((blob) => {
+            if (
+              loadToken !== expandedVideoLoadToken ||
+              expandedLightbox.root.hidden ||
+              !activeGallery ||
+              expandedLightbox.video.hidden
+            ) {
+              return;
+            }
+            expandedVideoObjectUrl = URL.createObjectURL(blob);
+            expandedLightbox.video.src = expandedVideoObjectUrl;
+          })
+          .catch(() => {
+            if (loadToken === expandedVideoLoadToken && !expandedLightbox.video.src) {
+              expandedLightbox.video.src = source;
+            }
+          });
+      }
+    } else {
+      resetExpandedVideo();
+      lightbox.image.hidden = false;
+      lightbox.image.src = mediaSource(item);
+      lightbox.image.alt = item.alt;
+    }
     lightbox.caption.textContent = label;
     lightbox.counter.textContent = `${activeGallery.index + 1} / ${activeGallery.items.length}`;
     lightbox.previousButton.hidden = activeGallery.items.length < 2;
     lightbox.nextButton.hidden = activeGallery.items.length < 2;
-    lightbox.root.setAttribute("aria-label", `Image preview: ${label}`);
+    lightbox.root.setAttribute(
+      "aria-label",
+      `${kind === "video" ? "Video" : "Image"} preview: ${label}`,
+    );
     lightbox.root.hidden = false;
   };
 
   const closeLightbox = () => {
     activeGallery = null;
-    if (!lightbox || lightbox.root.hidden) return;
+    if (!lightbox) return;
+    resetExpandedVideo();
+    if (lightbox.root.hidden) return;
 
     lightbox.root.hidden = true;
     lightbox.image.removeAttribute("src");
+    lightbox.image.hidden = false;
     lightbox.caption.textContent = "";
     lightbox.counter.textContent = "";
     if (originalOverflow !== null) {
@@ -781,9 +1104,9 @@ export function mountImagePreview(signal: AbortSignal): () => void {
     if (focusTarget?.isConnected) focusTarget.focus();
   };
 
-  const openGallery = (items: HTMLImageElement[], index: number) => {
+  const openGallery = (items: MediaElement[], index: number) => {
     const item = items[index];
-    if (!item || !imageSource(item)) return;
+    if (!item || !mediaSource(item)) return;
     if (!lightbox) {
       lightbox = createLightbox();
       lightbox.closeButton.addEventListener("click", (event) => {
@@ -858,6 +1181,20 @@ export function mountImagePreview(signal: AbortSignal): () => void {
       return;
     }
 
+    const linkedImage = target.closest<HTMLAnchorElement>(
+      `[data-${LINK_TARGET_ATTRIBUTE.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}='true']`,
+    );
+    if (linkedImage) {
+      const image = linkedImage.querySelector<HTMLImageElement>(
+        `img[${IMAGE_PREVIEW_DATA_ATTRIBUTE}]`,
+      );
+      if (!image) return;
+      event.preventDefault();
+      event.stopPropagation();
+      openGallery([image], 0);
+      return;
+    }
+
     const image = target.closest<HTMLImageElement>(`img[${IMAGE_PREVIEW_DATA_ATTRIBUTE}]`);
     if (!image) return;
 
@@ -884,6 +1221,19 @@ export function mountImagePreview(signal: AbortSignal): () => void {
 
     const target = event.target;
     if (
+      target instanceof HTMLAnchorElement &&
+      target.dataset[LINK_TARGET_ATTRIBUTE] === "true" &&
+      (event.key === "Enter" || event.key === " ")
+    ) {
+      const image = target.querySelector<HTMLImageElement>(
+        `img[${IMAGE_PREVIEW_DATA_ATTRIBUTE}]`,
+      );
+      if (!image) return;
+      event.preventDefault();
+      openGallery([image], 0);
+      return;
+    }
+    if (
       target instanceof HTMLImageElement &&
       target.dataset[IMAGE_PREVIEW_ATTRIBUTE] === "true" &&
       (event.key === "Enter" || event.key === " ")
@@ -899,8 +1249,8 @@ export function mountImagePreview(signal: AbortSignal): () => void {
 
   const mountBody = () => {
     if (disposed || !document.body) return;
-    scanLinks(document, generatedImages);
-    refreshGalleries(originals, galleries);
+    scanLinks(document, generatedMedia);
+    refreshGalleries(originals, galleries, linkedImageTriggers);
     observer = new MutationObserver((records) => {
       let changed = false;
       for (const record of records) {
@@ -910,12 +1260,20 @@ export function mountImagePreview(signal: AbortSignal): () => void {
           if (element.matches(GALLERY_OWNED_SELECTOR) || element.closest(GALLERY_OWNED_SELECTOR)) {
             continue;
           }
-          if (!hasImageContent(element)) continue;
-          scanLinks(element, generatedImages);
+          if (!hasMediaContent(element)) continue;
+          scanLinks(element, generatedMedia);
           changed = true;
         }
+        for (const node of Array.from(record.removedNodes)) {
+          if (node.nodeType !== Node.ELEMENT_NODE) continue;
+          const element = node as Element;
+          if (element.matches(GALLERY_OWNED_SELECTOR) || element.closest(GALLERY_OWNED_SELECTOR)) {
+            continue;
+          }
+          if (hasMediaContent(element)) changed = true;
+        }
       }
-      if (changed) refreshGalleries(originals, galleries);
+      if (changed) refreshGalleries(originals, galleries, linkedImageTriggers);
     });
     observer.observe(document.body, { childList: true, subtree: true });
   };
@@ -947,13 +1305,25 @@ export function mountImagePreview(signal: AbortSignal): () => void {
     for (const record of Array.from(galleries.values())) {
       destroyGallery(record, originals, galleries);
     }
-    restoreAllImages(originals);
+    restoreAllMedia(originals);
 
-    for (const [image, link] of generatedImages) {
-      image.remove();
+    for (const [media, link] of generatedMedia) {
+      if (media instanceof HTMLVideoElement) media.pause();
+      media.remove();
       delete link.dataset[IMAGE_LINK_ATTRIBUTE];
     }
-    generatedImages.clear();
+    generatedMedia.clear();
+
+    for (const [link, original] of linkedImageTriggers) {
+      if (original.role === null) link.removeAttribute("role");
+      else link.setAttribute("role", original.role);
+      if (original.ariaLabel === null) link.removeAttribute("aria-label");
+      else link.setAttribute("aria-label", original.ariaLabel);
+      if (original.ariaHasPopup === null) link.removeAttribute("aria-haspopup");
+      else link.setAttribute("aria-haspopup", original.ariaHasPopup);
+      delete link.dataset[LINK_TARGET_ATTRIBUTE];
+    }
+    linkedImageTriggers.clear();
 
     document.removeEventListener("click", onClick, true);
     document.removeEventListener("keydown", onKeyDown, true);
