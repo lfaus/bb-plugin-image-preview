@@ -424,6 +424,7 @@ function createLightbox(): Lightbox {
 
   const image = document.createElement("img");
   image.className = "bb-image-preview-expanded";
+  image.referrerPolicy = "no-referrer";
   image.alt = "";
 
   const counter = document.createElement("div");
@@ -506,6 +507,8 @@ function addImageLinkPreview(
   if (link.querySelector("img")) return;
 
   const image = document.createElement("img");
+  // Links can point at any host; do not leak the BB origin to it.
+  image.referrerPolicy = "no-referrer";
   image.src = href;
   image.alt = link.textContent?.trim() || "Image preview";
   image.loading = "lazy";
@@ -619,6 +622,7 @@ function buildGallery(
 
     const preview = document.createElement("img");
     preview.className = "bb-image-preview-gallery-image";
+    preview.referrerPolicy = "no-referrer";
     preview.src = imageSource(source);
     preview.alt = source.alt;
     preview.loading = "lazy";

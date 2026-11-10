@@ -160,4 +160,24 @@ describe("mountImagePreview", () => {
 
     dispose();
   });
+
+  it("loads linked and expanded images without a referrer", () => {
+    const message = document.createElement("article");
+    message.dataset.messageId = "message-3";
+    const link = document.createElement("a");
+    link.href = "https://example.com/remote.png";
+    link.textContent = "remote.png";
+    message.append(link);
+    document.body.append(message);
+
+    const dispose = mountImagePreview(new AbortController().signal);
+
+    const generated = link.querySelector("img");
+    expect(generated?.referrerPolicy).toBe("no-referrer");
+    generated?.click();
+    const expanded = document.querySelector<HTMLImageElement>(".bb-image-preview-expanded");
+    expect(expanded?.referrerPolicy).toBe("no-referrer");
+
+    dispose();
+  });
 });
